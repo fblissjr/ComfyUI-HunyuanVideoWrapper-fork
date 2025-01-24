@@ -1,5 +1,24 @@
 # ComfyUI wrapper nodes for [HunyuanVideo](https://github.com/Tencent/HunyuanVideo)
 
+# RichSpace feature testing
+
+Attempting to implement this paper: https://arxiv.org/abs/2501.09982
+
+*tldr*:
+- key insight from the paper is that text encoder embeddings can be interpolated to achieve better control over video generation features
+- from paper:
+```In summary, our main contributions are as follows:
+- We demonstrate that selecting the correct text embedding can effectively guide a video gen-
+eration model to produce the desired video.
+- We propose a simple yet effective algorithm to find the optimal text embedding through the
+use of perpendicular foot embeddings and cosine similarity.
+```
+
+
+- ![image](https://github.com/user-attachments/assets/5b0cdd5d-56be-4e1e-b613-d6092a9078f0)
+
+
+
 # Update 3:
 
 It's been hectic couple of weeks with this model, I've lost track of what has happened since the start, but I'll try to present some of the more important updates:
