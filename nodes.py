@@ -14,6 +14,7 @@ from .hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from .hyvideo.diffusion.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
 from .hyvideo.diffusion.schedulers.scheduling_sasolver import SASolverScheduler
 from. hyvideo.diffusion.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
+import torch.nn.functional as F
 
 # from diffusers.schedulers import ( 
 #     DDIMScheduler, 
@@ -742,30 +743,142 @@ class HyVideoCustomPromptTemplate:
         }
         return (prompt_template_dict,)
 
+
+class RichSpaceInterpolator:
+    """
+    Handles text embedding interpolation following the RichSpace paper methodology.
+    This class encapsulates the core mathematical operations for finding optimal
+    interpolation points between text embeddings.
+    """
+    def __init__(self, text_encoder):
+        self.text_encoder = text_encoder
+
+    def calculate_perpendicular_foot(self, embed_a: torch.Tensor, embed_b: torch.Tensor, 
+                                   embed_guide: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates the perpendicular foot point as described in Algorithm 3 of the RichSpace paper.
+        This is the projection of the guide embedding onto the line between embeddings A and B.
+        
+        Args:
+            embed_a: First text embedding tensor
+            embed_b: Second text embedding tensor
+            embed_guide: Guide embedding tensor that describes desired features
+            
+        Returns:
+            Tensor containing the perpendicular foot point embedding
+        """
+        # Convert any attention mask or other tensor dimensions to 2D for projection
+        if len(embed_a.shape) > 2:
+            embed_a = embed_a.reshape(embed_a.shape[0], -1)
+            embed_b = embed_b.reshape(embed_b.shape[0], -1)
+            embed_guide = embed_guide.reshape(embed_guide.shape[0], -1)
+            
+        # Calculate vectors for projection
+        vec_ac = embed_guide - embed_a  # Vector from A to guide point
+        vec_ab = embed_b - embed_a      # Vector from A to B
+        
+        # Calculate projection length using inner product
+        # (vec_ac · vec_ab) / (vec_ab · vec_ab)
+        proj_length = torch.sum(vec_ac * vec_ab, dim=-1, keepdim=True) / \
+                     torch.sum(vec_ab * vec_ab, dim=-1, keepdim=True)
+        
+        # Calculate projection vector and foot point
+        proj_vec = proj_length * vec_ab
+        foot_point = embed_a + proj_vec
+        
+        # Restore original tensor shape if needed
+        if len(embed_guide.shape) > 2:
+            foot_point = foot_point.reshape(embed_guide.shape)
+            
+        return foot_point
+
+    def find_optimal_interpolation(self, embed_a: torch.Tensor, embed_b: torch.Tensor, 
+                                 embed_guide: torch.Tensor, num_steps: int = 30
+                                 ) -> Tuple[torch.Tensor, int]:
+        """
+        Finds the optimal interpolation point between two embeddings that best matches 
+        the guide embedding, as described in the RichSpace paper.
+        
+        Args:
+            embed_a: First text embedding tensor
+            embed_b: Second text embedding tensor
+            embed_guide: Guide embedding tensor that describes desired features
+            num_steps: Number of interpolation steps to try
+            
+        Returns:
+            Tuple of (optimal interpolated embedding, step index used)
+        """
+        # Calculate perpendicular foot point to use as reference
+        foot_point = self.calculate_perpendicular_foot(embed_a, embed_b, embed_guide)
+        
+        # Track similarities and interpolated embeddings
+        similarities = []
+        interpolated_embeds = []
+        
+        # Generate interpolations and calculate similarities
+        for i in range(num_steps):
+            # Linear interpolation between A and B
+            t = i / (num_steps - 1)
+            interp = t * embed_a + (1-t) * embed_b
+            
+            # Calculate cosine similarity with foot point
+            # Reshape tensors for similarity calculation if needed
+            flat_interp = interp.reshape(1, -1)
+            flat_foot = foot_point.reshape(1, -1)
+            
+            sim = F.cosine_similarity(flat_interp, flat_foot)
+            
+            similarities.append(sim.item())
+            interpolated_embeds.append(interp)
+
+        # Find optimal interpolation point
+        optimal_idx = torch.argmax(torch.tensor(similarities))
+        optimal_embedding = interpolated_embeds[optimal_idx]
+
+        return optimal_embedding, optimal_idx
+
 class HyVideoTextEncode:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
             "text_encoders": ("HYVIDTEXTENCODER",),
-            "prompt": ("STRING", {"default": "", "multiline": True} ),
+            "prompt": ("STRING", {"default": "", "multiline": True}),
             },
             "optional": {
                 "force_offload": ("BOOLEAN", {"default": True}),
-                "prompt_template": (["video", "image", "custom", "disabled"], {"default": "video", "tooltip": "Use the default prompt templates for the llm text encoder"}),
-                "custom_prompt_template": ("PROMPT_TEMPLATE", {"default": PROMPT_TEMPLATE["dit-llm-encode-video"], "multiline": True}),
-                "clip_l": ("CLIP", {"tooltip": "Use comfy clip model instead, in this case the text encoder loader's clip_l should be disabled"}),
-                "hyvid_cfg": ("HYVID_CFG", ),
+                "prompt_template": (["video", "image", "custom", "disabled"], {
+                    "default": "video", 
+                    "tooltip": "Use the default prompt templates for the llm text encoder"
+                }),
+                "custom_prompt_template": ("PROMPT_TEMPLATE", {
+                    "default": PROMPT_TEMPLATE["dit-llm-encode-video"]
+                }),
+                "clip_l": ("CLIP", {
+                    "tooltip": "Use comfy clip model instead, in this case the text encoder loader's clip_l should be disabled"
+                }),
+                "hyvid_cfg": ("HYVID_CFG",),
+                # RichSpace features
+                "enable_richspace": ("BOOLEAN", {"default": False}),
+                "interpolation_prompt_a": ("STRING", {"default": "", "multiline": True}),
+                "interpolation_prompt_b": ("STRING", {"default": "", "multiline": True}),
+                "interpolation_steps": ("INT", {"default": 30, "min": 2, "max": 100}),
             }
         }
 
-    RETURN_TYPES = ("HYVIDEMBEDS", )
+    RETURN_TYPES = ("HYVIDEMBEDS",)
     RETURN_NAMES = ("hyvid_embeds",)
     FUNCTION = "process"
     CATEGORY = "HunyuanVideoWrapper"
 
-    def process(self, text_encoders, prompt, force_offload=True, prompt_template="video", custom_prompt_template=None, clip_l=None, image_token_selection_expr="::4", hyvid_cfg=None, image1=None, image2=None, clip_text_override=None):
+    def process(self, text_encoders, prompt, force_offload=True, prompt_template="video",
+                custom_prompt_template=None, clip_l=None, hyvid_cfg=None,
+                enable_richspace=False, interpolation_prompt_a="", interpolation_prompt_b="",
+                interpolation_steps=30, image_token_selection_expr="::4", 
+                image1=None, image2=None, clip_text_override=None):
+        
         if clip_text_override is not None and len(clip_text_override) == 0:
             clip_text_override = None
+            
         device = mm.text_encoder_device()
         offload_device = mm.text_encoder_offload_device()
 
@@ -775,6 +888,7 @@ class HyVideoTextEncode:
         else:
             text_encoder_2 = None
 
+        # Handle CFG settings
         if hyvid_cfg is not None:
             negative_prompt = hyvid_cfg["negative_prompt"]
             do_classifier_free_guidance = True
@@ -782,6 +896,7 @@ class HyVideoTextEncode:
             do_classifier_free_guidance = False
             negative_prompt = None
 
+        # Handle prompt template settings
         if prompt_template != "disabled":
             if prompt_template == "custom":
                 prompt_template_dict = custom_prompt_template
@@ -791,122 +906,144 @@ class HyVideoTextEncode:
                 prompt_template_dict = PROMPT_TEMPLATE["dit-llm-encode"]
             else:
                 raise ValueError(f"Invalid prompt_template: {prompt_template_dict}")
-            assert (
-                isinstance(prompt_template_dict, dict)
-                and "template" in prompt_template_dict
-            ), f"`prompt_template` must be a dictionary with a key 'template', got {prompt_template_dict}"
-            assert "{}" in str(prompt_template_dict["template"]), (
-                "`prompt_template['template']` must contain a placeholder `{}` for the input text, "
-                f"got {prompt_template_dict['template']}"
-            )
+            
+            # Validate prompt template structure
+            assert isinstance(prompt_template_dict, dict) and "template" in prompt_template_dict, \
+                f"prompt_template must be a dictionary with a key 'template', got {prompt_template_dict}"
+            
+            # Validate template contains required placeholder
+            assert "{}" in str(prompt_template_dict["template"]), \
+                f"Template must contain placeholder '{{}}', got {prompt_template_dict['template']}"
         else:
             prompt_template_dict = None
 
-        def encode_prompt(self, prompt, negative_prompt, text_encoder, image_token_selection_expr="::4", image1=None, image2=None, clip_text_override=None):
+        def encode_prompt(self, prompt, negative_prompt, text_encoder, 
+                         image_token_selection_expr="::4", image1=None, image2=None, 
+                         clip_text_override=None):
+            """Helper function to encode a single prompt with its negative prompt if CFG is enabled"""
             batch_size = 1
             num_videos_per_prompt = 1
 
+            # Process main prompt
             text_inputs = text_encoder.text2tokens(prompt, 
-                                                   prompt_template=prompt_template_dict,
-                                                   image1=image1,
-                                                   image2=image2,
-                                                   clip_text_override=clip_text_override)
+                                                prompt_template=prompt_template_dict,
+                                                image1=image1,
+                                                image2=image2,
+                                                clip_text_override=clip_text_override)
+            
             prompt_outputs = text_encoder.encode(text_inputs, 
-                                                 prompt_template=prompt_template_dict, 
-                                                 image_token_selection_expr=image_token_selection_expr, 
-                                                 device=device
-                                                 )
+                                             prompt_template=prompt_template_dict,
+                                             image_token_selection_expr=image_token_selection_expr,
+                                             device=device)
             prompt_embeds = prompt_outputs.hidden_state
 
+            # Handle attention masks
             attention_mask = prompt_outputs.attention_mask
             log.info(f"{text_encoder.text_encoder_type} prompt attention_mask shape: {attention_mask.shape}, masked tokens: {attention_mask[0].sum().item()}")
             if attention_mask is not None:
                 attention_mask = attention_mask.to(device)
                 bs_embed, seq_len = attention_mask.shape
                 attention_mask = attention_mask.repeat(1, num_videos_per_prompt)
-                attention_mask = attention_mask.view(
-                    bs_embed * num_videos_per_prompt, seq_len
-                )
+                attention_mask = attention_mask.view(bs_embed * num_videos_per_prompt, seq_len)
 
             prompt_embeds = prompt_embeds.to(dtype=text_encoder.dtype, device=device)
 
-            # get unconditional embeddings for classifier free guidance
+            # Handle classifier-free guidance embeddings if enabled
             if do_classifier_free_guidance:
                 uncond_tokens: List[str]
                 if negative_prompt is None:
                     uncond_tokens = [""] * batch_size
                 elif prompt is not None and type(prompt) is not type(negative_prompt):
-                    raise TypeError(
-                        f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
-                        f" {type(prompt)}."
-                    )
+                    raise TypeError(f"`negative_prompt` should be same type as `prompt`, got {type(negative_prompt)} != {type(prompt)}")
                 elif isinstance(negative_prompt, str):
                     uncond_tokens = [negative_prompt]
                 elif batch_size != len(negative_prompt):
-                    raise ValueError(
-                        f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
-                        f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
-                        " the batch size of `prompt`."
-                    )
+                    raise ValueError(f"Batch size mismatch between prompt ({batch_size}) and negative_prompt ({len(negative_prompt)})")
                 else:
                     uncond_tokens = negative_prompt
 
-                # max_length = prompt_embeds.shape[1]
                 uncond_input = text_encoder.text2tokens(uncond_tokens, prompt_template=prompt_template_dict)
-
-                negative_prompt_outputs = text_encoder.encode(
-                    uncond_input, prompt_template=prompt_template_dict, device=device
-                )
+                negative_prompt_outputs = text_encoder.encode(uncond_input, 
+                                                         prompt_template=prompt_template_dict,
+                                                         device=device)
                 negative_prompt_embeds = negative_prompt_outputs.hidden_state
 
                 negative_attention_mask = negative_prompt_outputs.attention_mask
                 if negative_attention_mask is not None:
                     negative_attention_mask = negative_attention_mask.to(device)
                     _, seq_len = negative_attention_mask.shape
-                    negative_attention_mask = negative_attention_mask.repeat(
-                        1, num_videos_per_prompt
-                    )
+                    negative_attention_mask = negative_attention_mask.repeat(1, num_videos_per_prompt)
                     negative_attention_mask = negative_attention_mask.view(
-                        batch_size * num_videos_per_prompt, seq_len
-                    )
+                        batch_size * num_videos_per_prompt, seq_len)
             else:
                 negative_prompt_embeds = None
                 negative_attention_mask = None
 
-            return (
-                prompt_embeds,
-                negative_prompt_embeds,
-                attention_mask,
-                negative_attention_mask,
-            )
+            return (prompt_embeds, negative_prompt_embeds, attention_mask, negative_attention_mask)
+
+        # Move primary text encoder to device
         text_encoder_1.to(device)
-        with torch.autocast(device_type=mm.get_autocast_device(device), dtype=text_encoder_1.dtype, enabled=text_encoder_1.is_fp8):
-            prompt_embeds, negative_prompt_embeds, attention_mask, negative_attention_mask = encode_prompt(self,
-                                                                                                            prompt,
-                                                                                                            negative_prompt, 
-                                                                                                            text_encoder_1, 
-                                                                                                            image_token_selection_expr=image_token_selection_expr,
-                                                                                                            image1=image1,
-                                                                                                            image2=image2)
+        
+        # Handle RichSpace interpolation if enabled
+        if enable_richspace and interpolation_prompt_a and interpolation_prompt_b:
+            interpolator = RichSpaceInterpolator(text_encoder_1)
+            
+            # Get embeddings for interpolation prompts and guide prompt
+            with torch.autocast(device_type=mm.get_autocast_device(device), 
+                              dtype=text_encoder_1.dtype, 
+                              enabled=text_encoder_1.is_fp8):
+                # Encode all prompts
+                embed_a = encode_prompt(self, interpolation_prompt_a, negative_prompt, 
+                                     text_encoder_1, image_token_selection_expr)[0]
+                embed_b = encode_prompt(self, interpolation_prompt_b, negative_prompt, 
+                                     text_encoder_1, image_token_selection_expr)[0]
+                guide_embed = encode_prompt(self, prompt, negative_prompt, 
+                                         text_encoder_1, image_token_selection_expr)[0]
+                
+                # Find optimal interpolation
+                optimal_embedding, step_idx = interpolator.find_optimal_interpolation(
+                    embed_a, embed_b, guide_embed, num_steps=interpolation_steps)
+                
+                # Use interpolated embedding for final generation
+                prompt_embeds, negative_prompt_embeds, attention_mask, negative_attention_mask = \
+                    encode_prompt(self, prompt, negative_prompt, text_encoder_1, 
+                                image_token_selection_expr)
+                prompt_embeds = optimal_embedding
+        else:
+            # Standard encoding path without interpolation
+            with torch.autocast(device_type=mm.get_autocast_device(device), 
+                              dtype=text_encoder_1.dtype,
+                              enabled=text_encoder_1.is_fp8):
+                prompt_embeds, negative_prompt_embeds, attention_mask, negative_attention_mask = \
+                    encode_prompt(self, prompt, negative_prompt, text_encoder_1,
+                                image_token_selection_expr, image1, image2)
+
+        # Handle device offloading for primary encoder
         if force_offload:
             text_encoder_1.to(offload_device)
             mm.soft_empty_cache()
 
+        # Handle secondary encoder (CLIP or text_encoder_2)
         if text_encoder_2 is not None:
             text_encoder_2.to(device)
-            prompt_embeds_2, negative_prompt_embeds_2, attention_mask_2, negative_attention_mask_2 = encode_prompt(self, prompt, negative_prompt, text_encoder_2, clip_text_override=clip_text_override)
+            prompt_embeds_2, negative_prompt_embeds_2, attention_mask_2, negative_attention_mask_2 = \
+                encode_prompt(self, prompt, negative_prompt, text_encoder_2, 
+                            clip_text_override=clip_text_override)
             if force_offload:
                 text_encoder_2.to(offload_device)
                 mm.soft_empty_cache()
         elif clip_l is not None:
             clip_l.cond_stage_model.to(device)
-            tokens = clip_l.tokenize(prompt if clip_text_override is None else clip_text_override, return_word_ids=True)
-            prompt_embeds_2 = clip_l.encode_from_tokens(tokens, return_pooled=True, return_dict=False)[1]
+            tokens = clip_l.tokenize(prompt if clip_text_override is None else clip_text_override,
+                                   return_word_ids=True)
+            prompt_embeds_2 = clip_l.encode_from_tokens(tokens, return_pooled=True, 
+                                                      return_dict=False)[1]
             prompt_embeds_2 = prompt_embeds_2.to(device=device)
 
             if negative_prompt is not None:
                 tokens = clip_l.tokenize(negative_prompt, return_word_ids=True)
-                negative_prompt_embeds_2 = clip_l.encode_from_tokens(tokens, return_pooled=True, return_dict=False)[1]
+                negative_prompt_embeds_2 = clip_l.encode_from_tokens(tokens, return_pooled=True,
+                                                                   return_dict=False)[1]
                 negative_prompt_embeds_2 = negative_prompt_embeds_2.to(device=device)
             else:
                 negative_prompt_embeds_2 = None
@@ -921,19 +1058,21 @@ class HyVideoTextEncode:
             attention_mask_2 = None
             negative_attention_mask_2 = None
 
+        # Construct final embeddings dictionary
         prompt_embeds_dict = {
-                "prompt_embeds": prompt_embeds,
-                "negative_prompt_embeds": negative_prompt_embeds,
-                "attention_mask": attention_mask,
-                "negative_attention_mask": negative_attention_mask,
-                "prompt_embeds_2": prompt_embeds_2,
-                "negative_prompt_embeds_2": negative_prompt_embeds_2,
-                "attention_mask_2": attention_mask_2,
-                "negative_attention_mask_2": negative_attention_mask_2,
-                "cfg": torch.tensor(hyvid_cfg["cfg"]) if hyvid_cfg is not None else None,
-                "start_percent": torch.tensor(hyvid_cfg["start_percent"]) if hyvid_cfg is not None else None,
-                "end_percent": torch.tensor(hyvid_cfg["end_percent"]) if hyvid_cfg is not None else None,
-            }
+            "prompt_embeds": prompt_embeds,
+            "negative_prompt_embeds": negative_prompt_embeds,
+            "attention_mask": attention_mask,
+            "negative_attention_mask": negative_attention_mask,
+            "prompt_embeds_2": prompt_embeds_2,
+            "negative_prompt_embeds_2": negative_prompt_embeds_2,
+            "attention_mask_2": attention_mask_2,
+            "negative_attention_mask_2": negative_attention_mask_2,
+            "cfg": torch.tensor(hyvid_cfg["cfg"]) if hyvid_cfg is not None else None,
+            "start_percent": torch.tensor(hyvid_cfg["start_percent"]) if hyvid_cfg is not None else None,
+            "end_percent": torch.tensor(hyvid_cfg["end_percent"]) if hyvid_cfg is not None else None,
+        }
+        
         return (prompt_embeds_dict,)
 
 class HyVideoTextImageEncode(HyVideoTextEncode):
@@ -1289,6 +1428,75 @@ class HyVideoSampler:
         return ({
             "samples": out_latents.cpu() / VAE_SCALING_FACTOR
             },)
+        
+class HyVideoRichSpaceTextEncode(HyVideoTextEncode):
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "text_encoders": ("HYVIDTEXTENCODER",),
+                "prompt_a": ("STRING", {"default": "", "multiline": True}),
+                "prompt_b": ("STRING", {"default": "", "multiline": True}),
+                "guide_prompt": ("STRING", {"default": "", "multiline": True}),
+                "interpolation_steps": ("INT", {"default": 30, "min": 2, "max": 100})
+            },
+            "optional": {
+                "force_offload": ("BOOLEAN", {"default": True}),
+                "prompt_template": (["video", "image", "custom", "disabled"],),
+                "custom_prompt_template": ("PROMPT_TEMPLATE",),
+                "clip_l": ("CLIP",)
+            }
+        }
+
+    def process_richspace(self, text_encoders, prompt_a, prompt_b, guide_prompt,
+                         interpolation_steps=30, **kwargs):
+        """
+        Process the prompts using RichSpace interpolation, letting the Sampler 
+        handle the embedded guidance scale.
+        """
+        # Use the base process method for interpolation
+        return super().process(
+            text_encoders=text_encoders,
+            prompt=guide_prompt,
+            enable_richspace=True,
+            interpolation_prompt_a=prompt_a,
+            interpolation_prompt_b=prompt_b,
+            interpolation_steps=interpolation_steps,
+            **kwargs
+        )
+
+class RichSpaceMultiInterpolator(RichSpaceInterpolator):
+    """
+    Extends RichSpaceInterpolator to handle interpolation between multiple embeddings.
+    This allows for more complex feature combinations as described in the RichSpace paper.
+    """
+    def interpolate_multiple(self, embeddings: List[torch.Tensor], 
+                           guide_embed: torch.Tensor,
+                           steps_per_pair: int = 30) -> Tuple[torch.Tensor, List[int]]:
+        """
+        Performs sequential interpolation between multiple embeddings.
+        
+        Args:
+            embeddings: List of text embedding tensors to interpolate between
+            guide_embed: Guide embedding tensor describing desired features
+            steps_per_pair: Number of interpolation steps to try between each pair
+            
+        Returns:
+            Tuple of (final optimal embedding, list of step indices used)
+        """
+        if len(embeddings) < 2:
+            raise ValueError("Need at least 2 embeddings for interpolation")
+            
+        current_embed = embeddings[0]
+        step_indices = []
+        
+        # Sequentially interpolate between pairs
+        for i in range(1, len(embeddings)):
+            current_embed, step_idx = self.find_optimal_interpolation(
+                current_embed, embeddings[i], guide_embed, steps_per_pair)
+            step_indices.append(step_idx)
+            
+        return current_embed, step_indices
 
 #region VideoDecode
 class HyVideoDecode:
@@ -1520,6 +1728,7 @@ NODE_CLASS_MAPPINGS = {
     "HyVideoContextOptions": HyVideoContextOptions,
     "HyVideoEnhanceAVideo": HyVideoEnhanceAVideo,
     "HyVideoTeaCache": HyVideoTeaCache,
+    "HyVideoRichSpaceTextEncode": HyVideoRichSpaceTextEncode,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "HyVideoSampler": "HunyuanVideo Sampler",
@@ -1543,4 +1752,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HyVideoContextOptions": "HunyuanVideo Context Options",
     "HyVideoEnhanceAVideo": "HunyuanVideo Enhance A Video",
     "HyVideoTeaCache": "HunyuanVideo TeaCache",
+    "HyVideoRichSpaceTextEncode": "HunyuanVideo RichSpace TextEncode",
     }
