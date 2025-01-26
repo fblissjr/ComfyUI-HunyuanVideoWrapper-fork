@@ -599,7 +599,6 @@ class HyVideoTorchCompileSettings:
         return (compile_args, )
 
 #region TextEncode
-
 class DownloadAndLoadHyVideoTextEncoder:
     @classmethod
     def INPUT_TYPES(s):
