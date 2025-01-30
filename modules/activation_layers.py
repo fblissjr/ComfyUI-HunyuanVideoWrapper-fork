@@ -1,6 +1,5 @@
 import torch.nn as nn
 
-
 def get_activation_layer(act_type):
     """get activation layer
 

@@ -1,9 +1,13 @@
 from ..utils.log import log
 from ..modules.models import HYVideoDiffusionTransformer
-from ..diffusion.schedulers.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
-from ..diffusion.pipelines.pipeline_hunyuan_video import HunyuanVideoPipeline
+from ..pipelines.pipeline_hunyuan_video import HunyuanVideoPipeline
+from ..samplers.dpm import DPMSolverMultistepScheduler
+from ..samplers.flow_match import FlowMatchDiscreteScheduler
+from ..samplers.sa import SASolverScheduler
+from ..samplers.base import BaseSampler
 import torch
 import gc
+import comfy.samplers
 
 class HyVideoSampler:
     @classmethod
@@ -11,7 +15,7 @@ class HyVideoSampler:
         return {
             "required": {
                 "model": ("HYVIDEOMODEL",),
-                "hyvid_embeds": ("HYVIDEMBEDS",),
+                "hyvid_embeds": ("HYVIDEMBEDS", ),
                 "width": (
                     "INT",
                     {"default": 512, "min": 64, "max": 4096, "step": 16},
@@ -32,14 +36,8 @@ class HyVideoSampler:
                         "tooltip": "guidance scale",
                     },
                 ),
-                "sampler_name": (
-                    ["flow_match"],
-                    {
-                        "tooltip": "Schedule name (different schedulers have different behaviour in terms of steps)"
-                    },
-                ),
-                "scheduler": (
-                    ["flow_match"],
+                "sampler_name": (["dpmsolver++", "flow_match", "sa_solver"],),
+                "scheduler": (["euler"], # for now, only euler is supported - will update later to be more comprehensive
                     {
                         "tooltip": "Schedule name (different schedulers have different behaviour in terms of steps)"
                     },
@@ -53,5 +51,5 @@ class HyVideoSampler:
     FUNCTION = "sample"
     CATEGORY = "sampling"
 
-    def sample(self, model, hyvid_embeds, steps, cfg, seed, width, height, num_frames, sampler_name, scheduler, samples=None, stg_args=None, context_options=None, feta_args=None, teacache_args=None):
+    def process(self, model, hyvid_embeds, flow_shift, steps, cfg, seed, width, height, num_frames, sampler_name, scheduler, samples=None, stg_args=None, context_options=None, feta_args=None, teacache_args=None):
         pass

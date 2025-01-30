@@ -49,7 +49,6 @@ MEMORY_LAYOUT = {
     ),
 }
 
-
 def get_cu_seqlens(text_mask, img_len):
     """Calculate cu_seqlens_q, cu_seqlens_kv using text_mask and img_len
 
@@ -74,7 +73,6 @@ def get_cu_seqlens(text_mask, img_len):
         cu_seqlens[2 * i + 2] = s2
 
     return cu_seqlens
-
 
 def attention(
     q,

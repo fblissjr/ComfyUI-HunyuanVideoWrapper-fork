@@ -5,7 +5,6 @@ from einops import rearrange, repeat
 
 from ..utils.helpers import to_2tuple
 
-
 class PatchEmbed(nn.Module):
     """2D Image to Patch Embedding
 
@@ -58,7 +57,6 @@ class PatchEmbed(nn.Module):
         x = self.norm(x)
         return x
 
-
 class TextProjection(nn.Module):
     """
     Projects text embeddings. Also handles dropout for classifier-free guidance.
@@ -89,7 +87,6 @@ class TextProjection(nn.Module):
         hidden_states = self.linear_2(hidden_states)
         return hidden_states
 
-
 def timestep_embedding(t, dim, max_period=10000):
     """
     Create sinusoidal timestep embeddings.
@@ -115,7 +112,6 @@ def timestep_embedding(t, dim, max_period=10000):
     if dim % 2:
         embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
     return embedding
-
 
 class TimestepEmbedder(nn.Module):
     """

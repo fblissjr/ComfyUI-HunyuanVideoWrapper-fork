@@ -3,7 +3,6 @@ from typing import Callable
 import torch
 import torch.nn as nn
 
-
 class ModulateDiT(nn.Module):
     """Modulation layer for DiT."""
     def __init__(
@@ -27,7 +26,6 @@ class ModulateDiT(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear(self.act(x))
 
-
 def modulate(x, shift=None, scale=None):
     """modulate by shift and scale
 
@@ -48,7 +46,6 @@ def modulate(x, shift=None, scale=None):
     else:
         return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-
 def apply_gate(x, gate=None, tanh=False):
     """AI is creating summary for apply_gate
 
@@ -66,7 +63,6 @@ def apply_gate(x, gate=None, tanh=False):
         return x * gate.unsqueeze(1).tanh()
     else:
         return x * gate.unsqueeze(1)
-
 
 def ckpt_wrapper(module):
     def ckpt_forward(*inputs):

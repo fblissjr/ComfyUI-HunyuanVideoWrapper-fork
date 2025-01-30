@@ -9,7 +9,6 @@ import torch.nn as nn
 from .modulate_layers import modulate
 from ..utils.helpers import to_2tuple
 
-
 class MLP(nn.Module):
     """MLP as used in Vision Transformer, MLP-Mixer and related networks"""
 
@@ -58,7 +57,6 @@ class MLP(nn.Module):
         x = self.drop2(x)
         return x
 
-
 # 
 class MLPEmbedder(nn.Module):
     """copied from https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/layers.py"""
@@ -71,7 +69,6 @@ class MLPEmbedder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.out_layer(self.silu(self.in_layer(x)))
-
 
 class FinalLayer(nn.Module):
     """The final layer of DiT."""

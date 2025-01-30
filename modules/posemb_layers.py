@@ -1,7 +1,6 @@
 import torch
 from typing import Union, Tuple, List
 
-
 def _to_tuple(x, dim=2):
     if isinstance(x, int):
         return (x,) * dim
@@ -9,7 +8,6 @@ def _to_tuple(x, dim=2):
         return x
     else:
         raise ValueError(f"Expected length {dim} or int, but got {x}")
-
 
 def get_meshgrid_nd(start, *args, dim=2):
     """
@@ -54,7 +52,6 @@ def get_meshgrid_nd(start, *args, dim=2):
     grid = torch.stack(grid, dim=0)  # [dim, W, H, D]
 
     return grid
-
 
 #################################################################################
 #                   Rotary Positional Embedding Functions                       #
@@ -103,7 +100,6 @@ def apply_rotary_emb(
         xk_out = apply_rotary(xk, cos, sin)
 
     return xq_out, xk_out
-
 
 def get_nd_rotary_pos_embed(
     rope_dim_list,
@@ -173,7 +169,6 @@ def get_nd_rotary_pos_embed(
     else:
         emb = torch.cat(embs, dim=1)  # (WHD, D/2)
         return emb
-
 
 def get_1d_rotary_pos_embed(
     dim: int,

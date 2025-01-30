@@ -3,11 +3,24 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel, LlavaForConditionalGeneration, AutoProcessor
+from transformers import (
+    CLIPTextModel,
+    CLIPTokenizer,
+    AutoTokenizer,
+    AutoModel,
+    LlavaForConditionalGeneration,
+    AutoProcessor,
+)
 
 from ..utils.log import log
-from ..constants import TEXT_ENCODER_PATH, TOKENIZER_PATH
-from ..utils.token_helper import find_subsequence, multi_slice_to_mask
+from ..utils.path_utils import (
+    get_model_path,
+    get_lora_path,
+    get_text_encoder_path,
+    get_vae_path,
+    get_hyvid_embeds_path,
+)
+from .text_utils import apply_text_to_template
 from PIL import Image
 
 def use_default(value, default):
@@ -23,7 +36,7 @@ def load_text_encoder(
     quantization_config=None,
 ):
     if text_encoder_path is None:
-        text_encoder_path = TEXT_ENCODER_PATH[text_encoder_type]
+        text_encoder_path = get_text_encoder_path(text_encoder_type)
     if logger is not None:
         logger.info(
             f"Loading text encoder model ({text_encoder_type}) from: {text_encoder_path}"
@@ -66,7 +79,7 @@ def load_tokenizer(
     tokenizer_type, tokenizer_path=None, padding_side="right", logger=None
 ):
     if tokenizer_path is None:
-        tokenizer_path = TOKENIZER_PATH[tokenizer_type]
+        tokenizer_path = get_text_encoder_path(tokenizer_type)
     if logger is not None:
         logger.info(f"Loading tokenizer ({tokenizer_type}) from: {tokenizer_path}")
 
@@ -104,3 +117,451 @@ class TextEncoderModelOutput:
     attention_mask: Optional[torch.LongTensor] = None
     hidden_states_list: Optional[Tuple[torch.FloatTensor, ...]] = None
     text_outputs: Optional[list] = None
+
+class DownloadAndLoadHyVideoTextEncoder:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "llm_model": (
+                    [
+                        "xtuner/llava-llama-3-8b-v1_1-transformers",
+                    ],
+                ),
+                "clip_model": (
+                    [
+                        "disabled",
+                        "openai/clip-vit-large-patch14",
+                    ],
+                ),
+                "precision": (["fp16", "fp32", "bf16"], {"default": "bf16"}),
+            },
+            "optional": {
+                "apply_final_norm": ("BOOLEAN", {"default": False}),
+                "hidden_state_skip_layer": ("INT", {"default": 2}),
+                "quantization": (
+                    ["disabled", "bnb_nf4", "fp8_e4m3fn"],
+                    {"default": "disabled"},
+                ),
+                # Note: Changing max_context_length is experimental and may cause instability or higher memory use
+                # max_context_length = 8192 is based on: https://huggingface.co/xtuner/llava-llama-3-8b-v1_1-transformers/blob/main/config.json
+                "max_context_length": (
+                    "INT",
+                    {
+                        "default": 256,  # HunyuanVideo default is 256
+                        "min": 1,
+                        "max": 8192,  # Max context length for the LLM
+                        "step": 1,
+                        "tooltip": "The maximum context length / max tokens for the LLM. Default is 256. Changing this is experimental and may cause instability in generation and performance, higher memory usage, or system crashes.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("HYVIDTEXTENCODER",)
+    RETURN_NAMES = ("hyvid_text_encoder",)
+    FUNCTION = "loadmodel"
+    CATEGORY = "HunyuanVideoWrapper"
+    DESCRIPTION = "Loads Hunyuan text_encoder model from 'ComfyUI/models/llm'"
+
+    def loadmodel(
+        self,
+        llm_model,
+        clip_model,
+        precision,
+        apply_final_norm=False,
+        hidden_state_skip_layer=2,
+        quantization="disabled",
+        max_context_length=256,
+    ):
+        lm_type_mapping = {
+            "xtuner/llava-llama-3-8b-v1_1-transformers": "vlm",
+        }
+        lm_type = lm_type_mapping[llm_model]
+        device = mm.get_torch_device()
+        dtype = {
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+            "fp32": torch.float32,
+        }[precision]
+
+        quantization_config = None
+        if quantization == "bnb_nf4":
+            from transformers import BitsAndBytesConfig
+
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+
+        if clip_model != "disabled":
+            clip_model_path = get_text_encoder_path(clip_model)
+            text_encoder_2 = TextEncoder(
+                text_encoder_path=clip_model_path,
+                text_encoder_type="clipL",
+                max_length=77,
+                text_encoder_precision=precision,
+                tokenizer_type="clipL",
+                logger=log,
+                device=device,
+            )
+        else:
+            text_encoder_2 = None
+
+        llm_model_path = get_text_encoder_path(llm_model)
+
+        # Validation for max_context_length
+        if max_context_length <= PROMPT_TEMPLATE["dit-llm-encode-video"]["crop_start"]:
+            raise ValueError(
+                f"max_context_length ({max_context_length}) must be greater than crop_start ({PROMPT_TEMPLATE['dit-llm-encode-video']['crop_start']}) for the 'video' template."
+            )
+
+        # DEBUG: Log the max_length used by the TextEncoder
+        log.debug(
+            f"DownloadAndLoadHyVideoTextEncoder: Loading text encoder with max_context_length: {max_context_length}"
+        )
+
+        text_encoder = TextEncoder(
+            text_encoder_path=llm_model_path,
+            text_encoder_type=lm_type,
+            max_length=max_context_length,  # max number of tokens / context for the LLM - default is 256
+            text_encoder_precision=precision,
+            tokenizer_type=lm_type,
+            hidden_state_skip_layer=hidden_state_skip_layer,
+            apply_final_norm=apply_final_norm,
+            logger=log,
+            device=device,
+            dtype=dtype,
+            quantization_config=quantization_config,
+        )
+
+        # DEBUG: Log the max_length used by the TextEncoder
+        log.debug(
+            f"[[DEBUG]] DownloadAndLoadHyVideoTextEncoder: TextEncoder initialized with max_length: {text_encoder.max_length}"
+        )
+
+        if quantization == "fp8_e4m3fn":
+            text_encoder.is_fp8 = True
+            text_encoder.to(torch.float8_e4m3fn)
+
+            def forward_hook(module):
+                def forward(hidden_states):
+                    input_dtype = hidden_states.dtype
+                    hidden_states = hidden_states.to(torch.float32)
+                    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+                    hidden_states = hidden_states * torch.rsqrt(
+                        variance + module.variance_epsilon
+                    )
+                    return module.weight.to(input_dtype) * hidden_states.to(
+                        input_dtype
+                    )
+
+                return forward
+
+            for module in text_encoder.model.modules():
+                if module.__class__.__name__ in ["Embedding"]:
+                    module.to(dtype)
+                if module.__class__.__name__ in ["LlamaRMSNorm"]:
+                    module.forward = forward_hook(module)
+        else:
+            text_encoder.is_fp8 = False
+
+        hyvid_text_encoders = {
+            "text_encoder": text_encoder,
+            "text_encoder_2": text_encoder_2,
+        }
+
+        return (hyvid_text_encoders,)
+    
+class TextEncoder(nn.Module):
+    def __init__(
+        self,
+        text_encoder_type: str,
+        max_length: int,
+        text_encoder_precision: Optional[str] = None,
+        text_encoder_path: Optional[str] = None,
+        tokenizer_type: Optional[str] = None,
+        tokenizer_path: Optional[str] = None,
+        output_key: Optional[str] = None,
+        use_attention_mask: bool = True,
+        input_max_length: Optional[int] = None,
+        hidden_state_skip_layer: Optional[int] = None,
+        apply_final_norm: bool = False,
+        reproduce: bool = False,
+        logger=None,
+        device=None,
+        dtype=torch.float16,
+        quantization_config=None,
+    ):
+        super().__init__()
+        self.text_encoder_type = text_encoder_type
+        self.max_length = max_length
+        self.precision = text_encoder_precision
+        self.model_path = text_encoder_path
+        self.tokenizer_type = (
+            tokenizer_type if tokenizer_type is not None else text_encoder_type
+        )
+        self.tokenizer_path = (
+            tokenizer_path if tokenizer_path is not None else text_encoder_path
+        )
+        self.use_attention_mask = use_attention_mask
+
+        self.input_max_length = (
+            input_max_length if input_max_length is not None else max_length
+        )
+        self.hidden_state_skip_layer = hidden_state_skip_layer
+        self.apply_final_norm = apply_final_norm
+        self.reproduce = reproduce
+        self.logger = logger
+        self.is_fp8 = False
+        self.processor = None
+
+        if "t5" in text_encoder_type:
+            self.output_key = output_key or "last_hidden_state"
+        elif "clip" in text_encoder_type:
+            self.output_key = output_key or "pooler_output"
+        elif (
+            "llm" in text_encoder_type
+            or "glm" in text_encoder_type
+            or "vlm" in text_encoder_type
+        ):
+            self.output_key = output_key or "last_hidden_state"
+            if "glm" in text_encoder_type or "vlm" in text_encoder_type:
+                self.processor = AutoProcessor.from_pretrained(
+                    text_encoder_path, device=device
+                )
+        else:
+            raise ValueError(f"Unsupported text encoder type: {text_encoder_type}")
+
+        self.model, self.model_path = load_text_encoder(
+            text_encoder_type=self.text_encoder_type,
+            text_encoder_precision=self.precision,
+            text_encoder_path=self.model_path,
+            logger=self.logger,
+            device=device,
+            dtype=dtype,
+            quantization_config=quantization_config,
+        )
+        self.dtype = self.model.dtype
+        self.device = self.model.device
+
+        self.tokenizer, self.tokenizer_path = load_tokenizer(
+            tokenizer_type=self.tokenizer_type,
+            tokenizer_path=self.tokenizer_path,
+            padding_side="right",
+            logger=self.logger,
+        )
+
+    def __repr__(self):
+        return f"{self.text_encoder_type} ({self.precision} - {self.model_path})"
+
+    def text2tokens(
+        self, text, prompt_template, image1=None, image2=None, clip_text_override=None
+    ):
+        """
+        Tokenize the input text.
+
+        Args:
+            text (str or list): Input text.
+        """
+        if (
+            self.text_encoder_type != "vlm" and image1 is not None
+        ):
+            raise ValueError("Only vision_languague models support image input")
+        tokenize_input_type = "str"
+        if (
+            prompt_template is not None
+            and self.text_encoder_type == "llm"
+            or self.text_encoder_type == "vlm"
+        ):
+            if isinstance(text, (list, tuple)):
+                text = [
+                    apply_text_to_template(
+                        one_text, prompt_template["template"]
+                    )
+                    for one_text in text
+                ]
+                if isinstance(text[0], list):
+                    tokenize_input_type = "list"
+            elif isinstance(text, str):
+                text = apply_text_to_template(
+                    text, prompt_template["template"]
+                )
+                if isinstance(text, list):
+                    tokenize_input_type = "list"
+            else:
+                raise TypeError(f"Unsupported text type: {type(text)}")
+        elif clip_text_override is not None and self.text_encoder_type == "clipL":
+            text = clip_text_override
+
+        kwargs = dict(
+            truncation=True,
+            max_length=self.max_length,
+            padding="max_length" if self.text_encoder_type != "vlm" else "do_not_pad",
+            return_tensors="pt",
+        )
+        if tokenize_input_type == "str":
+            text_tokens = self.tokenizer(text, return_length=False, return_overflowing_tokens=False, return_attention_mask=True, **kwargs)
+            if self.text_encoder_type == "vlm":
+                raw_images = []
+                if image1 is not None:
+                    raw_images.append(image1.squeeze(0) * 255)
+                if image2 is not None:
+                    raw_images.append(image2.squeeze(0) * 255)
+                text_tokens = self.processor(
+                    raw_images,
+                    text,
+                    **kwargs,
+                ).to(0, torch.float16)
+            return text_tokens
+        elif tokenize_input_type == "list":
+            return self.tokenizer.apply_chat_template(
+                text,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                **kwargs,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported tokenize_input_type: {tokenize_input_type}"
+            )
+
+    def encode(
+        self,
+        batch_encoding,
+        use_attention_mask=None,
+        output_hidden_states=False,
+        do_sample=None,
+        hidden_state_skip_layer=None,
+        return_texts=False,
+        prompt_template=None,
+        image_token_selection_expr="::4",
+        device=None,
+    ):
+        """
+        Args:
+            batch_encoding (dict): Batch encoding from tokenizer.
+            use_attention_mask (bool): Whether to use attention mask. If None, use self.use_attention_mask.
+                Defaults to None.
+            output_hidden_states (bool): Whether to output hidden states. If False, return the value of
+                self.output_key. If True, return the entire output. If set self.hidden_state_skip_layer,
+                output_hidden_states will be set True. Defaults to False.
+            do_sample (bool): Whether to sample from the model. Used for Decoder-Only LLMs. Defaults to None.
+                When self.produce is False, do_sample is set to True by default.
+            hidden_state_skip_layer (int): Number of hidden states to hidden_state_skip_layer. 0 means the last layer.
+                If None, self.output_key will be used. Defaults to None.
+            return_texts (bool): Whether to return the decoded texts. Defaults to False.
+        """
+        device = self.model.device if device is None else device
+        use_attention_mask = use_default(use_attention_mask, self.use_attention_mask)
+        hidden_state_skip_layer = use_default(
+            hidden_state_skip_layer, self.hidden_state_skip_layer
+        )
+        do_sample = use_default(do_sample, not self.reproduce)
+        attention_mask = (
+            batch_encoding["attention_mask"].to(device) if use_attention_mask else None
+        )
+        for k, v in batch_encoding.items():
+            batch_encoding[k] = (
+                v.to(device) if isinstance(v, torch.Tensor) else v
+            )
+        outputs = self.model(
+            **batch_encoding,
+            output_hidden_states=output_hidden_states
+            or hidden_state_skip_layer is not None,
+        )
+
+        if hidden_state_skip_layer is not None:
+            last_hidden_state = outputs.hidden_states[-(hidden_state_skip_layer + 1)]
+            # Real last hidden state already has layer norm applied. So here we only apply it
+            # for intermediate layers.
+            if hidden_state_skip_layer > 0 and self.apply_final_norm:
+                last_hidden_state = self.model.final_layer_norm(last_hidden_state)
+        else:
+            last_hidden_state = outputs[self.output_key]
+
+        # Remove hidden states of instruction tokens, only keep prompt tokens.
+        if prompt_template is not None and self.text_encoder_type == "llm":
+            crop_start = prompt_template.get("crop_start", -1)
+            if crop_start > 0:
+                last_hidden_state = last_hidden_state[:, crop_start:]
+                attention_mask = (
+                    attention_mask[:, crop_start:] if use_attention_mask else None
+                )
+        # this will likely change after implementing image functionality
+        # elif prompt_template is not None and self.text_encoder_type == "vlm":
+        #     # Temporory implementation for one round chat template to get rid of system prompts aand chat header
+        #     user_start_tokens = self.tokenizer(
+        #         text="<|start_header_id|>user<|end_header_id|>",
+        #         add_special_tokens=False,
+        #         return_tensors="pt",
+        #     )
+        #     image_token = self.tokenizer(
+        #         text="<image>",
+        #         add_special_tokens=False,
+        #         return_tensors="pt",
+        #     )
+        #     image_token = image_token["input_ids"].to(device)
+        #     user_start_tokens["input_ids"] = user_start_tokens["input_ids"].to(device)
+        #     tk_idx, tk_n, tk_len = find_subsequence(
+        #         batch_encoding["input_ids"], user_start_tokens["input_ids"]
+        #     )
+        #     if tk_n != 1:
+        #         raise ValueError(
+        #             "Template seems not in the required format, do you have <|start_header_id|>user<|end_header_id|> in place, and only one round of user input?"
+        #         )
+        #     user_tokens = batch_encoding["input_ids"][:, tk_idx[0] + tk_len :]
+        #     img_idx, img_n, _ = find_subsequence(user_tokens, image_token)
+        #     img_seq_len = outputs["image_hidden_states"].shape[1]
+        #     last_hidden_state = last_hidden_state[:, tk_idx[0] + tk_len :]
+        #     # create image_mask to subset non-image hidden state
+        #     seq_mask = torch.ones_like(last_hidden_state, device=device, dtype=torch.bool)
+        #     img_mask = torch.zeros_like(
+        #         outputs["image_hidden_states"][0:1], device=device, dtype=torch.bool
+        #     )
+        #     img_mask[:, multi_slice_to_mask(image_token_selection_expr, img_mask.shape[1])] = True
+
+        #     drift = 0
+        #     for i in img_idx:
+        #         i = i + drift
+        #         seq_mask[:, i : i + img_seq_len, :] = img_mask
+        #         drift += img_seq_len
+
+        #     last_hidden_state = last_hidden_state[seq_mask].view(
+        #         1, -1, outputs["image_hidden_states"].shape[-1]
+        #     )
+
+        #     attention_mask = torch.ones(
+        #         last_hidden_state.shape[0], last_hidden_state.shape[1], device=device, dtype=torch.int64
+        #     )
+
+        # elif prompt_template is None and self.text_encoder_type == "vlm":
+        #     raise ValueError("Vlm encoders must use compatiable chat template.")
+
+        if output_hidden_states:
+            return TextEncoderModelOutput(
+                last_hidden_state, attention_mask, outputs.hidden_states
+            )
+        return TextEncoderModelOutput(last_hidden_state, attention_mask)
+
+    def forward(
+        self,
+        text,
+        use_attention_mask=None,
+        output_hidden_states=False,
+        do_sample=False,
+        hidden_state_skip_layer=None,
+        return_texts=False,
+    ):
+        batch_encoding = self.text2tokens(text)
+        return self.encode(
+            batch_encoding,
+            use_attention_mask=use_attention_mask,
+            output_hidden_states=output_hidden_states,
+            do_sample=do_sample,
+            hidden_state_skip_layer=hidden_state_skip_layer,
+            return_texts=return_texts,
+        )

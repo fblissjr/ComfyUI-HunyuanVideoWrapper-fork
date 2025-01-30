@@ -10,7 +10,58 @@ from ..utils.log import log
 # imports needed for when we add these back later:
 from diffusers.video_processor import VideoProcessor
 from typing import List, Dict, Any, Tuple
-from ..hyvideo.vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
+
+from ..modules.vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
+from ..utils.path_utils import get_vae_path
+
+VAE_SCALING_FACTOR = 0.476986
+
+def load_vae(vae_type, device=None, vae_precision="fp16", config_path=None, logger=None, model_path=None):
+    """the function to load the 3D VAE model
+
+    Args:
+        vae_type (str): the type of the 3D VAE model. Defaults to "884-16c-hy".
+        device (str): The device to load the model onto. Defaults to None.
+        vae_precision (str, optional): the precision to load vae. Defaults to None.
+        config_path (str, optional): the path to vae config. Defaults to None.
+        logger (_type_, optional): logger. Defaults to None.
+        model_path (str, optional): the path to vae. Defaults to None.
+    """
+    if config_path is None:
+        raise ValueError(f"'config_path' is required in load_vae")
+    if model_path is None:
+        raise ValueError(f"'model_path' is required in load_vae")
+    if logger is not None:
+        logger.info(f"Loading 3D VAE model ({vae_type}) from: {model_path}")
+    with open(config_path) as f:
+        vae_config = json.load(f)
+
+    vae = AutoencoderKLCausal3D.from_config(vae_config)
+
+    vae_ckpt = model_path
+    assert os.path.isfile(vae_ckpt), f"VAE checkpoint not found: {vae_ckpt}"
+
+    ckpt = load_torch_file(vae_ckpt, safe_load=True)
+    if "state_dict" in ckpt:
+        ckpt = ckpt["state_dict"]
+    vae_ckpt = {k.replace("vae.", ""): v for k, v in ckpt.items() if k.startswith("vae.")}
+    vae.load_state_dict(vae_ckpt)
+    del vae_ckpt
+    vae.requires_grad_(False)
+    vae.eval()
+
+    vae_dtype = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }[vae_precision]
+
+    vae.to(device=device, dtype=vae_dtype)
+
+    if logger is not None:
+        logger.info(f"VAE to dtype: {vae.dtype}")
+
+    return vae
 
 class HyVideoVAELoader:
     @classmethod
@@ -18,6 +69,7 @@ class HyVideoVAELoader:
         return {
             "required": {
                 "model_name": (folder_paths.get_filename_list("vae"), {"tooltip": "These models are loaded from 'ComfyUI/models/vae'"}),
+                "vae_config": (folder_paths.get_filename_list("vae_configs"), {"tooltip": "Select the config that corresponds to the selected vae"}),
             },
             "optional": {
                 "precision": (["fp16", "fp32", "bf16"],
@@ -33,40 +85,25 @@ class HyVideoVAELoader:
     CATEGORY = "HunyuanVideoWrapper"
     DESCRIPTION = "Loads Hunyuan VAE model from 'ComfyUI/models/vae'"
 
-    def loadmodel(self, model_name, precision, compile_args=None):
-
+    def loadmodel(self, model_name, vae_config, precision, compile_args=None):
         device = mm.get_torch_device()
-        offload_device = mm.unet_offload_device()
-
-        dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
-        # After updating the directory structure, this will no longer be needed
-        # with open(os.path.join(script_directory, 'configs', 'hy_vae_config.json')) as f:
-        #     vae_config = json.load(f)
-        # Instead, we should put the config json alongside other models so it can be used the same way,
-        # i.e. we will modify this line later to use something like this:
-        vae_config_path = folder_paths.get_full_path("vae_configs", "hy_vae_config.json")
-        with open(vae_config_path) as f:
-            vae_config = json.load(f)
-        model_path = folder_paths.get_full_path("vae", model_name)
-        vae_sd = load_torch_file(model_path, safe_load=True)
-
-        vae = AutoencoderKLCausal3D.from_config(vae_config)
-        vae.load_state_dict(vae_sd)
-        del vae_sd
-        vae.requires_grad_(False)
-        vae.eval()
-        vae.to(device = device, dtype = dtype)
+        model_path = get_vae_path(model_name)
+        config_path = get_vae_path(vae_config)
+        vae = load_vae(
+            "884-16c-hy",
+            device=device,
+            vae_precision=precision,
+            logger=log,
+            model_path=model_path,
+            config_path=config_path,
+        )
 
         #compile
         if compile_args is not None:
             torch._dynamo.config.cache_size_limit = compile_args["dynamo_cache_size_limit"]
             vae = torch.compile(vae, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
-            
 
         return (vae,)
-
-# at the moment these are equivalent to just using the VAE loader/encoder/decoder nodes provided by comfyui. we will
-# modify these and add functionality in later steps, after we are done refactoring.
 
 class HyVideoEncode:
     @classmethod
@@ -110,10 +147,8 @@ class HyVideoEncode:
         if enable_vae_tiling:
             vae.enable_tiling()
         latents = vae.encode(image).latent_dist.sample(generator)
-        #latents = latents * vae.config.scaling_factor
+        latents = latents * VAE_SCALING_FACTOR
         vae.to(offload_device)
-        print("encoded latents shape",latents.shape)
-
         return ({"samples": latents},)
 
 class HyVideoDecode:
@@ -166,7 +201,7 @@ class HyVideoDecode:
             raise ValueError(
                 f"Only support latents with shape (b, c, h, w) or (b, c, f, h, w), but got {latents.shape}."
             )
-        #latents = latents / vae.config.scaling_factor
+        latents = latents / VAE_SCALING_FACTOR
         latents = latents.to(vae.dtype).to(device)
 
         if enable_vae_tiling:

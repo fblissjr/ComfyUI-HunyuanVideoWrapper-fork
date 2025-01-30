@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 
-
 class RMSNorm(nn.Module):
     def __init__(
         self,
@@ -57,7 +56,6 @@ class RMSNorm(nn.Module):
         if hasattr(self, "weight"):
             output = output * self.weight
         return output
-
 
 def get_norm_layer(norm_layer):
     """
