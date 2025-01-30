@@ -2,8 +2,9 @@
 import torch
 import comfy.model_management as mm
 import torch.nn.functional as FF
-
-from .hyvideo.modules.attention import attention
+import utils.log as log
+import importlib.metadata
+from ..modules.attention import attention
 
 def print_memory(device):
     memory = torch.cuda.memory_allocated(device) / 1024**3
@@ -110,3 +111,12 @@ def convert_fp8_linear(module, original_dtype):
             setattr(layer, "fp8_scale", fp8_map[key].to(dtype=original_dtype))
             setattr(layer, "original_forward", original_forward)
             setattr(layer, "forward", lambda input, m=layer: fp8_linear_forward(m, original_dtype, input))
+
+def check_diffusers_version():
+    try:
+        version = importlib.metadata.version('diffusers')
+        required_version = '0.31.0'
+        if version < required_version:
+            raise AssertionError(f"diffusers version {version} is installed, but version {required_version} or higher is required.")
+    except importlib.metadata.PackageNotFoundError:
+        raise AssertionError("diffusers is not installed.")

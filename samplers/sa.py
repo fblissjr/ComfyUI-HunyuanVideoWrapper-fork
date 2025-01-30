@@ -1,18 +1,18 @@
 import torch
 from .base import BaseSampler
-from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
+from diffusers.schedulers import SASolverScheduler
 
-class DPMSolverMultistep(BaseSampler):
+class SASolver(BaseSampler):
     def __init__(self):
         super().__init__()
-        # This is a workaround to make this code work with ComfyUI.
-        # I would like to remove this and make our code base fully compatible with diffusers,
+        # this is a workaround to make this code work with ComfyUI
+        # I would like to remove this and make our code base fully compatible with diffusers
         # but for now this is a quick fix to get things working, in a future refactor we'll follow
         # the standard approach.
-        self.scheduler = DPMSolverMultistepScheduler()
+        self.scheduler = SASolverScheduler()
         self.scheduler.alphas_cumprod = torch.tensor([0])
         self.scheduler.sigmas = torch.tensor([0])
-
+        
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -33,8 +33,8 @@ class DPMSolverMultistep(BaseSampler):
                         "round": 0.01,
                     },
                 ),
-                "sampler_name": (DPMSolverMultistepScheduler.SCHEDULER_NAMES,),
-                "scheduler": ("SCHEDULER",), # we will update these names later
+                "sampler_name": ("sa_solver",),
+                "scheduler": ("sgm_uniform", ), # we will update these names later
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
                 "latent_image": ("LATENT",),
@@ -42,7 +42,7 @@ class DPMSolverMultistep(BaseSampler):
         }
 
     def sample(self, model, add_noise, seed, steps, start_at_step, end_at_step, cfg, sampler_name, scheduler, positive, negative, latent_image, **kwargs):
-        # This does not match diffusers functionality exactly, but aims to be close enough
+        # this does not match diffusers functionality exactly, but aims to be close enough
         # that we can eventually refactor the two to be fully compatible in a later iteration
         # when doing so, it will be possible to delete our fork of DPMSolverMultistepScheduler
         # and use theirs instead.

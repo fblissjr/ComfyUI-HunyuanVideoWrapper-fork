@@ -1,5 +1,4 @@
-# content of samplers/base.py
-# defines common methods or attributes shared by sampler classes.
+# comfyui_hunyuanvideowrapper/samplers/base.py
 
 class BaseSampler:
     """
@@ -24,7 +23,7 @@ class BaseSampler:
     def __init__(self):
         pass  # you can initialize any common attributes here
 
-    def sample(self, *args, **kwargs):
+    def sample(self, model, noise, cfg, sampler_name, scheduler, positive, negative, latent_image, *args, **kwargs):
         """
         This method should implement the core sampling logic,
         common to all samplers.
@@ -33,5 +32,3 @@ class BaseSampler:
         if they need different behavior.
         """
         raise NotImplementedError("Subclasses must implement sampling logic")
-
-# any common helper functions can be added here in the future
