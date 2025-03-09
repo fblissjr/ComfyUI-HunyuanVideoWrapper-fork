@@ -6,7 +6,11 @@ from .utils import log, print_memory
 from diffusers.video_processor import VideoProcessor
 from typing import List, Dict, Any, Tuple
 import numpy as np
-from .hyvideo.constants import PROMPT_TEMPLATE
+from .hyvideo.constants import (
+    PROMPT_TEMPLATE,
+    PROMPT_TEMPLATE_ENCODE_VIDEO_I2V,
+    PROMPT_TEMPLATE_ENCODE_VIDEO,
+)
 from .hyvideo.text_encoder import TextEncoder
 from .hyvideo.utils.data_utils import align_to
 from .hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
@@ -1065,6 +1069,295 @@ class HyVideoI2VEncode(HyVideoTextEncode):
     FUNCTION = "process"
     CATEGORY = "HunyuanVideoWrapper"
 
+# region comfy native text encoder and clip
+class TextEncodeHunyuanVideo_Comfy:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "clip": ("CLIP",),
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+            }
+        }
+
+    RETURN_TYPES = ("HYVIDEMBEDS",)
+    FUNCTION = "encode"
+    CATEGORY = "advanced/conditioning"
+
+    def encode(self, clip, prompt):
+        # check model type
+        if hasattr(clip, "clip_l") and hasattr(clip, "llama"):
+            llama_template = PROMPT_TEMPLATE_ENCODE_VIDEO["template"]
+            crop_start = PROMPT_TEMPLATE_ENCODE_VIDEO["crop_start"]
+
+            # tokenize with the comfy (transformers) tokenizer
+            tokens = clip.tokenize_with_weights(prompt, llama_template=llama_template)
+
+            # get the full token embeddings from the LLM + Image in a single encode_token_weights call
+            llama_out, _, llama_extra_out = clip.encode_token_weights(tokens)
+
+            # apply template cropping to remove system prompt
+            if crop_start > 0:
+                llama_output = llama_out[:, crop_start:]
+                if "attention_mask" in llama_extra_out:
+                    attention_mask = llama_extra_out["attention_mask"][:, crop_start:]
+                else:
+                    attention_mask = torch.ones(
+                        llama_output.shape[0],
+                        llama_output.shape[1],
+                        device=llama_output.device,
+                        dtype=torch.bool,
+                    )
+            else:
+                llama_output = llama_out
+                if "attention_mask" in llama_extra_out:
+                    attention_mask = llama_extra_out["attention_mask"]
+                else:
+                    attention_mask = torch.ones(
+                        llama_output.shape[0],
+                        llama_output.shape[1],
+                        device=llama_output.device,
+                        dtype=torch.bool,
+                    )
+
+            # Create the output dictionary
+            prompt_embeds_dict = {
+                "prompt_embeds": llama_output,
+                "negative_prompt_embeds": None,
+                "attention_mask": attention_mask,
+                "negative_attention_mask": None,
+                "prompt_embeds_2": None,
+                "negative_prompt_embeds_2": None,
+                "attention_mask_2": None,
+                "negative_attention_mask_2": None,
+                "cfg": None,
+                "start_percent": None,
+                "end_percent": None,
+                "batched_cfg": None,
+            }
+
+            return (prompt_embeds_dict,)
+        else:
+            # If it's not the hunyuan_video model, log an error
+            log.info(
+                "Error: The provided CLIP model does not support HunyuanVideo encoding."
+            )
+            # Return a placeholder - should trigger an error in the next node
+            return ({"prompt_embeds": None},)
+
+
+class TextEncodeHunyuanVideo_ImageToVideo_Comfy:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "clip": ("CLIP",),
+                "clip_vision_output": ("CLIP_VISION_OUTPUT",),
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+                "image_interleave": (
+                    "INT",
+                    {
+                        "default": 4,
+                        "min": 1,
+                        "max": 512,
+                        "tooltip": "Image interval value. A higher interleave value (e.g., 4) means image tokens are placed less frequently in the token sequence",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("HYVIDEMBEDS",)
+    FUNCTION = "encode"
+    CATEGORY = "advanced/conditioning"
+
+    def encode(self, clip, clip_vision_output, prompt, image_interleave):
+        # check model type
+        if hasattr(clip, "clip_l") and hasattr(clip, "llama"):
+            llama_template = PROMPT_TEMPLATE_ENCODE_VIDEO_I2V["template"]
+            crop_start = PROMPT_TEMPLATE_ENCODE_VIDEO_I2V["crop_start"]
+
+            # extract image embeddings from CLIP vision output
+            if hasattr(clip_vision_output, "mm_projected"):
+                image_embeds = clip_vision_output.mm_projected
+            else:
+                # Try to get the image embeddings from the raw output
+                image_embeds = clip_vision_output.image_embeds
+
+            # tokenize with the comfy (transformers) tokenizer
+            tokens = clip.tokenize_with_weights(
+                prompt,
+                llama_template=llama_template,
+                image_embeds=image_embeds,
+                image_interleave=image_interleave,
+            )
+
+            # get the full token embeddings from the LLM + Image in a single encode_token_weights call
+            llama_out, _, llama_extra_out = clip.encode_token_weights(tokens)
+
+            # apply template cropping
+            if crop_start > 0:
+                llama_output = llama_out[:, crop_start:]
+                if "attention_mask" in llama_extra_out:
+                    attention_mask = llama_extra_out["attention_mask"][:, crop_start:]
+                else:
+                    attention_mask = torch.ones(
+                        llama_output.shape[0],
+                        llama_output.shape[1],
+                        device=llama_output.device,
+                        dtype=torch.bool,
+                    )
+            else:
+                llama_output = llama_out
+                if "attention_mask" in llama_extra_out:
+                    attention_mask = llama_extra_out["attention_mask"]
+                else:
+                    attention_mask = torch.ones(
+                        llama_output.shape[0],
+                        llama_output.shape[1],
+                        device=llama_output.device,
+                        dtype=torch.bool,
+                    )
+
+            # create the output dictionary
+            prompt_embeds_dict = {
+                "prompt_embeds": llama_output,
+                "negative_prompt_embeds": None,
+                "attention_mask": attention_mask,
+                "negative_attention_mask": None,
+                "prompt_embeds_2": None,
+                "negative_prompt_embeds_2": None,
+                "attention_mask_2": None,
+                "negative_attention_mask_2": None,
+                "cfg": None,
+                "start_percent": None,
+                "end_percent": None,
+                "batched_cfg": None,
+            }
+
+            return (prompt_embeds_dict,)
+        else:
+            # If it's not the hunyuan_video model, log an error
+            log.info(
+                "Error: The provided CLIP model does not support HunyuanVideo encoding."
+            )
+            # Return a placeholder
+            return ({"prompt_embeds": None},)
+
+
+# optional addition - cfg support using comfy native
+class TextEncodeHunyuanVideo_CFG_Comfy:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "clip": ("CLIP",),
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+                "negative_prompt": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "Aerial view, aerial view, overexposed, low quality, deformation, a poor composition, bad hands, bad teeth, bad eyes, bad limbs, distortion",
+                    },
+                ),
+            },
+            "optional": {
+                "cfg": (
+                    "FLOAT",
+                    {"default": 2.0, "min": 0.0, "max": 100.0, "step": 0.01},
+                ),
+                "start_percent": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "end_percent": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "batched_cfg": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("HYVIDEMBEDS",)
+    FUNCTION = "encode"
+    CATEGORY = "HunyuanVideoWrapper"
+
+    def encode(
+        self,
+        clip,
+        prompt,
+        negative_prompt,
+        cfg=2.0,
+        start_percent=0.0,
+        end_percent=1.0,
+        batched_cfg=True,
+    ):
+        device = mm.get_torch_device()
+        offload_device = mm.text_encoder_offload_device()
+
+        # extract crop_start
+        crop_start = PROMPT_TEMPLATE_ENCODE_VIDEO.get("crop_start", 0)
+
+        # move model to device
+        clip.cond_stage_model.to(device)
+
+        # process positive prompt
+        pos_tokens = clip.tokenize(
+            prompt, llama_template=PROMPT_TEMPLATE_ENCODE_VIDEO["template"]
+        )
+        pos_clip_embeds, pos_clip_pooled = (
+            clip.cond_stage_model.clip_l.encode_token_weights(pos_tokens["l"])
+        )
+        pos_out = clip.encode_from_tokens_scheduled(pos_tokens, unprojected=True)[0]
+        pos_cond = pos_out[0]
+
+        # process negative prompt
+        neg_tokens = clip.tokenize(
+            negative_prompt, llama_template=PROMPT_TEMPLATE_ENCODE_VIDEO["template"]
+        )
+        neg_clip_embeds, neg_clip_pooled = (
+            clip.cond_stage_model.clip_l.encode_token_weights(neg_tokens["l"])
+        )
+        neg_out = clip.encode_from_tokens_scheduled(neg_tokens, unprojected=True)[0]
+        neg_cond = neg_out[0]
+
+        # apply template cropping
+        if crop_start > 0:
+            pos_cond = pos_cond[:, crop_start:]
+            neg_cond = neg_cond[:, crop_start:]
+
+        # offload model
+        clip.cond_stage_model.to(offload_device)
+
+        # create attention masks
+        pos_attention_mask = torch.ones(
+            pos_cond.shape[1], dtype=torch.bool, device=pos_cond.device
+        ).unsqueeze(0)
+        neg_attention_mask = torch.ones(
+            neg_cond.shape[1], dtype=torch.bool, device=neg_cond.device
+        ).unsqueeze(0)
+        clip_attention_mask = torch.ones(
+            pos_clip_embeds.shape[1], dtype=torch.bool, device=pos_clip_embeds.device
+        ).unsqueeze(0)
+
+        # format output with CFG parameters
+        prompt_embeds_dict = {
+            "prompt_embeds": pos_cond,
+            "negative_prompt_embeds": neg_cond,
+            "attention_mask": pos_attention_mask,
+            "negative_attention_mask": neg_attention_mask,
+            "prompt_embeds_2": pos_clip_pooled,
+            "negative_prompt_embeds_2": neg_clip_pooled,
+            "attention_mask_2": clip_attention_mask,
+            "negative_attention_mask_2": clip_attention_mask,
+            "cfg": cfg,
+            "start_percent": start_percent,
+            "end_percent": end_percent,
+            "batched_cfg": batched_cfg,
+        }
+
+        return (prompt_embeds_dict,)
+
+
 # region CFG    
 class HyVideoCFG:
     @classmethod
@@ -1811,8 +2104,11 @@ NODE_CLASS_MAPPINGS = {
     "HyVideoTeaCache": HyVideoTeaCache,
     "HyVideoGetClosestBucketSize": HyVideoGetClosestBucketSize,
     "HyVideoI2VEncode": HyVideoI2VEncode,
-    "HyVideoEncodeKeyframes": HyVideoEncodeKeyframes
-    }
+    "HyVideoEncodeKeyframes": HyVideoEncodeKeyframes,
+    "TextEncodeHunyuanVideo_Comfy": TextEncodeHunyuanVideo_Comfy,
+    "TextEncodeHunyuanVideo_ImageToVideo_Comfy": TextEncodeHunyuanVideo_ImageToVideo_Comfy,
+    "TextEncodeHunyuanVideo_CFG_Comfy": TextEncodeHunyuanVideo_CFG_Comfy,
+}
 NODE_DISPLAY_NAME_MAPPINGS = {
     "HyVideoSampler": "HunyuanVideo Sampler",
     "HyVideoDecode": "HunyuanVideo Decode",
@@ -1837,5 +2133,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HyVideoTeaCache": "HunyuanVideo TeaCache",
     "HyVideoGetClosestBucketSize": "HunyuanVideo Get Closest Bucket Size",
     "HyVideoI2VEncode": "HyVideo I2V Encode",
-    "HyVideoEncodeKeyframes": "HyVideo Encode Keyframes"
-    }
+    "HyVideoEncodeKeyframes": "HyVideo Encode Keyframes",
+    "TextEncodeHunyuanVideo_Comfy": "HunyuanVideo Text Encode (Comfy)",
+    "TextEncodeHunyuanVideo_ImageToVideo_Comfy": "HunyuanVideo ImageToVideo Encode (Comfy)",
+    "TextEncodeHunyuanVideo_CFG_Comfy": "HunyuanVideo Text Encode w/ CFG (Comfy)",
+}
