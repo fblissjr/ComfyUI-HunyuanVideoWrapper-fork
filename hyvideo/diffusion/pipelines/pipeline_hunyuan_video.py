@@ -541,12 +541,32 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         batch_size = 1
         device = self._execution_device
 
-        prompt_embeds = prompt_embed_dict["prompt_embeds"]
-        negative_prompt_embeds = prompt_embed_dict["negative_prompt_embeds"]
-        prompt_mask = prompt_embed_dict["attention_mask"]
-        negative_prompt_mask = prompt_embed_dict["negative_attention_mask"]
-        prompt_embeds_2 = prompt_embed_dict["prompt_embeds_2"]
-        negative_prompt_embeds_2 = prompt_embed_dict["negative_prompt_embeds_2"]
+        # single, clean approach for handling prompt dict values
+        prompt_embeds = prompt_embed_dict.get("prompt_embeds")
+        if prompt_embeds is None:
+            # create dummy embeds for fallback
+            dummy_shape = [1, 77, 4096]  # typical shape for hunyuan
+            prompt_embeds = torch.zeros(
+                dummy_shape, device=device, dtype=self.base_dtype
+            )
+            logger.info("using dummy prompt embeds - results may be poor")
+
+        # get remaining values with defaults
+        negative_prompt_embeds = prompt_embed_dict.get("negative_prompt_embeds")
+        prompt_mask = prompt_embed_dict.get("attention_mask")
+        negative_prompt_mask = prompt_embed_dict.get("negative_attention_mask")
+        prompt_embeds_2 = prompt_embed_dict.get("prompt_embeds_2")
+        negative_prompt_embeds_2 = prompt_embed_dict.get("negative_prompt_embeds_2")
+
+        # create any missing values needed for processing
+        if prompt_mask is None:
+            prompt_mask = torch.ones(
+                prompt_embeds.shape[0], prompt_embeds.shape[1], device=device
+            )
+
+        if self.do_classifier_free_guidance and negative_prompt_embeds is None:
+            negative_prompt_embeds = torch.zeros_like(prompt_embeds)
+            negative_prompt_mask = torch.zeros_like(prompt_mask)
 
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch

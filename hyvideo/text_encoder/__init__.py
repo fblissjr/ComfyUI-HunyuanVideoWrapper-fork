@@ -62,14 +62,8 @@ def load_text_encoder(
     if logger is not None:
         logger.info(f"Text encoder to dtype: {dtype}")
 
-    # modify to avoid error in torch 2.7+: Cannot copy out of meta tensor; no data! Please use torch.nn.Module.to_empty() instead of torch.nn.Module.to() when moving module from meta to a different device.
     if device is not None and quantization_config is None:
-        try:
-            # traditional way to move model to device
-            text_encoder = text_encoder.to(device)
-        except NotImplementedError:
-            # for pytorch 2.6+ (stable and nightly)
-            text_encoder = text_encoder.to_empty(device=device)
+        text_encoder = text_encoder.to(device)
 
     return text_encoder, text_encoder_path
 
